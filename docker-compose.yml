@@ -1,0 +1,88 @@
+name: profkarniz
+
+x-database-env: &database-env
+  PGHOST: postgres
+  PGPORT: "5432"
+  POSTGRES_USER: ${POSTGRES_USER:-profkarniz}
+  POSTGRES_DB: ${POSTGRES_DB:-profkarniz}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+
+x-application: &application
+  build:
+    context: .
+    target: runtime
+  image: profkarniz-app:local
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      <<: *database-env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # No host ports: PostgreSQL is reachable only from the Compose network.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  migrate:
+    <<: *application
+    restart: "no"
+    command: ["node", "dist/db/migrate.js"]
+    environment:
+      <<: *database-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  application:
+    <<: *application
+    restart: unless-stopped
+    environment:
+      <<: *database-env
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      HTTP_HOST: 0.0.0.0
+      HTTP_PORT: "3000"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TELEGRAM_POLL_TIMEOUT_SECONDS: ${TELEGRAM_POLL_TIMEOUT_SECONDS:-30}
+      HEALTH_STALE_SECONDS: ${HEALTH_STALE_SECONDS:-120}
+      SHUTDOWN_TIMEOUT_SECONDS: ${SHUTDOWN_TIMEOUT_SECONDS:-25}
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 135s
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  postgres_data:

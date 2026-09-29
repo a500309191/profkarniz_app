@@ -1,0 +1,14 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+*.dump
+backups/
+.DS_Store
+.idea/
+.vscode/

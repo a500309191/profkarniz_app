@@ -1,0 +1,5 @@
+# Optional override for running Node locally. Bind PostgreSQL only to loopback.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${PGPORT:-5432}:5432"

@@ -15,6 +15,41 @@ export async function pause(ms: number, signal: AbortSignal) {
   catch (error) { if (!signal.aborted) throw error; }
 }
 
+function retryDelay(error: unknown, failures: number) {
+  const backoff = Math.min(30_000, 1000 * 2 ** Math.min(failures - 1, 5));
+  return Math.max(backoff + Math.floor(Math.random() * 250),
+    error instanceof TelegramError ? error.retryAfter * 1000 : 0);
+}
+
+export async function verifyTelegram(options: {
+  api: { verifyIdentity(signal: AbortSignal): Promise<string> };
+  state: CollectorState;
+  signal: AbortSignal;
+  logger: Logger;
+  sleep?: typeof pause;
+}): Promise<string | null> {
+  const { api, state, signal, logger } = options;
+  let failures = 0;
+  while (!signal.aborted) {
+    try {
+      const botId = await api.verifyIdentity(signal);
+      state.phase = 'starting';
+      state.lastError = null;
+      return botId;
+    } catch (error) {
+      if (signal.aborted) break;
+      if (!(error instanceof TelegramError) || error.fatal) throw error;
+      state.phase = 'retrying';
+      state.lastError = 'telegram';
+      const waitMs = retryDelay(error, ++failures);
+      logger.error({ event: 'telegram_startup_error', code: error.code,
+        network_codes: error.networkCodes, retry_ms: waitMs });
+      await (options.sleep ?? pause)(waitMs, signal);
+    }
+  }
+  return null;
+}
+
 export async function collect(options: {
   api: TelegramApi;
   store: UpdateStore;
@@ -64,11 +99,10 @@ export async function collect(options: {
       }
       state.phase = 'retrying';
       failures++;
-      const backoff = Math.min(30_000, 1000 * 2 ** Math.min(failures - 1, 5));
-      const waitMs = Math.max(backoff + Math.floor(Math.random() * 250),
-        error instanceof TelegramError ? error.retryAfter * 1000 : 0);
+      const waitMs = retryDelay(error, failures);
       logger.error({ event: stage === 'telegram' ? 'telegram_error' : 'database_error',
-        code: error instanceof TelegramError ? error.code : databaseErrorCode(error), retry_ms: waitMs });
+        code: error instanceof TelegramError ? error.code : databaseErrorCode(error),
+        network_codes: error instanceof TelegramError ? error.networkCodes : undefined, retry_ms: waitMs });
       await sleep(waitMs, signal);
     }
   }

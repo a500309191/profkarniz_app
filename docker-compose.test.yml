@@ -19,6 +19,9 @@ services:
       target: test
     environment:
       TEST_DATABASE_URL: postgresql://test:test-only-disposable@postgres:5432/profkarniz_test
+    # Enable IPv6 loopback for real local dual-stack socket tests only.
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
     command: ["sh", "-c", "npm run check && npm run test:integration"]
     depends_on:
       postgres:

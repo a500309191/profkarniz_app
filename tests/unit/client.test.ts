@@ -12,7 +12,36 @@ describe('read-only Telegram client', () => {
     expect(await new TelegramClient(token, 30, fetcher).getUpdates(100, signal)).toEqual([textUpdate]);
     const call = fetcher.mock.calls[0]!;
     expect(call[0]).toBe(`https://api.telegram.org/bot${token}/getUpdates`);
+    expect(call[1]).toHaveProperty('dispatcher');
     expect(JSON.parse(call[1]!.body as string)).toEqual({ offset: 100, timeout: 30, limit: 100, allowed_updates: [] });
+  });
+
+  it('reuses a dedicated dispatcher for all Bot API methods and closes it', async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response('{"ok":true,"result":{"id":123,"is_bot":true}}'))
+      .mockResolvedValueOnce(new Response('{"ok":true,"result":{"url":""}}'))
+      .mockResolvedValueOnce(new Response('{"ok":true,"result":[]}'));
+    const client = new TelegramClient(token, 30, fetcher);
+    try {
+      await client.verifyIdentity(signal);
+      await client.getUpdates(undefined, signal);
+      const dispatchers = fetcher.mock.calls.map(call => (call[1] as { dispatcher: unknown }).dispatcher);
+      expect(dispatchers[0]).toBeDefined();
+      expect(new Set(dispatchers).size).toBe(1);
+      expect(fetcher.mock.calls.every(call => new URL(String(call[0])).hostname === 'api.telegram.org')).toBe(true);
+    } finally { await client.close(); }
+  });
+
+  it('retains sanitized Undici timeout codes', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockRejectedValue(new Error('fetch failed', {
+      cause: Object.assign(new Error(`secret ${token}`), { code: 'UND_ERR_CONNECT_TIMEOUT' })
+    }));
+    const client = new TelegramClient(token, 30, fetcher);
+    try {
+      await expect(client.verifyIdentity(signal)).rejects.toMatchObject({
+        code: 'NETWORK', networkCodes: ['UND_ERR_CONNECT_TIMEOUT'], message: 'Telegram API request failed'
+      });
+    } finally { await client.close(); }
   });
 
   it('omits offset for the first poll, retaining all pending updates', async () => {

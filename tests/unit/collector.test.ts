@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { pino } from 'pino';
 import { CURSOR_TTL_MS, type BatchResult, type UpdateStore } from '../../src/db/store.js';
-import { collect, type CollectorState } from '../../src/telegram/collector.js';
+import { collect, verifyTelegram, type CollectorState } from '../../src/telegram/collector.js';
 import { TelegramError, type TelegramApi } from '../../src/telegram/client.js';
 import { textUpdate } from '../fixtures.js';
 
@@ -9,6 +9,38 @@ const logger = pino({ level: 'silent' });
 const saved: BatchResult = { inserted: 1, duplicates: 0, messages: 1,
   cursor: { offset: 102, lastUpdateAt: Date.now() } };
 const initialState = (): CollectorState => ({ phase: 'starting', lastSuccessAt: null, lastError: null });
+
+describe('startup network failures', () => {
+  it('retries transient getMe/getWebhookInfo failures instead of exiting the process', async () => {
+    const state = initialState();
+    const api = { verifyIdentity: vi.fn()
+      .mockRejectedValueOnce(new TelegramError('NETWORK', 0, ['ENETUNREACH']))
+      .mockResolvedValueOnce('123') };
+    const sleep = vi.fn(async (ms: number) => {
+      expect(ms).toBeGreaterThanOrEqual(1000);
+      expect(state).toMatchObject({ phase: 'retrying', lastError: 'telegram' });
+    });
+    expect(await verifyTelegram({ api, state, signal: new AbortController().signal, logger, sleep })).toBe('123');
+    expect(api.verifyIdentity).toHaveBeenCalledTimes(2);
+    expect(state).toMatchObject({ phase: 'starting', lastError: null });
+  });
+
+  it('respects rate limits and cancels retry on shutdown', async () => {
+    const controller = new AbortController();
+    const api = { verifyIdentity: vi.fn().mockRejectedValue(new TelegramError(429, 60)) };
+    const sleep = vi.fn(async (ms: number) => {
+      expect(ms).toBeGreaterThanOrEqual(60_000);
+      controller.abort();
+    });
+    expect(await verifyTelegram({ api, state: initialState(), signal: controller.signal, logger, sleep })).toBeNull();
+    expect(api.verifyIdentity).toHaveBeenCalledOnce();
+  });
+
+  it.each([401, 409])('retains fail-fast handling for configuration error %s', async code => {
+    await expect(verifyTelegram({ api: { verifyIdentity: async () => { throw new TelegramError(code); } },
+      state: initialState(), signal: new AbortController().signal, logger })).rejects.toMatchObject({ code });
+  });
+});
 
 describe('durable polling', () => {
   it('does not advance offset when saving fails and advances only after commit', async () => {

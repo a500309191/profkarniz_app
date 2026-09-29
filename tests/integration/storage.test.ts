@@ -155,7 +155,8 @@ it.skipIf(process.platform === 'win32')('runs the actual app, persists a mock up
     env: { ...process.env, TELEGRAM_BOT_TOKEN: '80001:TEST_ONLY', POSTGRES_USER: decodeURIComponent(target.username),
       POSTGRES_PASSWORD: decodeURIComponent(target.password), POSTGRES_DB: target.pathname.slice(1),
       PGHOST: target.hostname, PGPORT: target.port || '5432', PGOPTIONS: `-c search_path=${schema},public`,
-      HTTP_HOST: '127.0.0.1', HTTP_PORT: String(address.port), TELEGRAM_POLL_TIMEOUT_SECONDS: '1' },
+      HTTP_HOST: '127.0.0.1', HTTP_PORT: String(address.port), TELEGRAM_POLL_TIMEOUT_SECONDS: '1',
+      TEST_STARTUP_NETWORK_FAILURE: '1' },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let output = '';
@@ -175,6 +176,8 @@ it.skipIf(process.platform === 'win32')('runs the actual app, persists a mock up
     child.kill('SIGTERM');
     expect((await exit)[0], output).toBe(0);
     expect(output).toContain('application_stopped');
+    expect(output).toContain('telegram_startup_error');
+    expect(output).toContain('UND_ERR_CONNECT_TIMEOUT');
     expect(output).not.toContain('80001:TEST_ONLY');
     expect(output).not.toContain('private mock message');
   } finally {

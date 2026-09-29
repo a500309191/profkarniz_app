@@ -1,0 +1,17 @@
+# Opt-in for Linux VPS with working host IPv6 but an IPv4-only Docker bridge.
+# Requires Docker Engine >= 28 and Docker Compose >= 2.24.4.
+# Keep the base Compose project name/volume; only application shares host networking.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${HOST_POSTGRES_PORT:-55432}:5432"
+  application:
+    network_mode: host
+    ports: !reset []
+    environment:
+      PGHOST: 127.0.0.1
+      PGPORT: ${HOST_POSTGRES_PORT:-55432}
+      HTTP_HOST: 127.0.0.1
+      HTTP_PORT: ${HTTP_PORT:-3000}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+process.env.HTTP_PORT+'/health',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]

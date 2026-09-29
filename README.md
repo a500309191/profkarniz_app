@@ -94,6 +94,8 @@ src/
   logger.ts                 структурированные безопасные логи
   telegram/
     client.ts               read-only Telegram Bot API
+    transport.ts            отдельный Undici Agent: IPv6-first + IPv4 fallback
+    network-check.ts        диагностика DNS/IPv4/IPv6 без токена
     normalize.ts            проекция сообщений и metadata
     collector.ts            polling, retries, подтверждение после COMMIT
   db/
@@ -107,6 +109,7 @@ src/
 tests/                      unit, настоящий PostgreSQL и Linux process smoke test
 docker-compose.yml          application + PostgreSQL + one-shot migrate
 docker-compose.dev.yml      локальный доступ к БД только через loopback
+docker-compose.host-network.yml  opt-in Linux VPS: IPv6 через сеть хоста
 docker-compose.test.yml     изолированные тесты без реального токена
 .github/workflows/ci.yml    typecheck, lint, тесты, сборка Docker
 ```
@@ -122,7 +125,8 @@ docker-compose.test.yml     изолированные тесты без реа�
 | `PGHOST` | `127.0.0.1` | В Compose принудительно `postgres` |
 | `PGPORT` | `5432` | Порт; в Compose внутренний порт фиксирован |
 | `HTTP_HOST` | `127.0.0.1` | В контейнере `0.0.0.0` |
-| `HTTP_PORT` | `3000` | Локальный порт; внутри контейнера всегда 3000 |
+| `HTTP_PORT` | `3000` | Порт хоста; внутри bridge-контейнера 3000, в host-mode тот же HTTP_PORT |
+| `HOST_POSTGRES_PORT` | `55432` | Только host-network override: порт БД на 127.0.0.1 хоста |
 | `LOG_LEVEL` | `info` | trace/debug/info/warn/error/fatal/silent |
 | `TELEGRAM_POLL_TIMEOUT_SECONDS` | `30` | Long poll, от 1 до 50 секунд |
 | `HEALTH_STALE_SECONDS` | `120` | Допустимый возраст успешного цикла, 60–3600 секунд |
@@ -187,6 +191,116 @@ docker compose up -d application
 Перед обновлением делайте резервную копию. Остановка должна быть короткой: очередь
 Telegram ограничена по сроку хранения. Миграции применяются только вперёд;
 разрушительный `down` для исходной истории намеренно не реализован.
+
+## Telegram по IPv6 на VPS с недоступным IPv4
+
+Telegram client использует отдельный Undici Agent, переданный в каждый вызов
+Node.js 24 `fetch` через `dispatcher`. Закреплена совместимая версия Undici 7;
+переход на следующий major требует повторной проверки dispatcher API с встроенным
+fetch конкретного Node.js 24. Системный DNS resolver вызывается с
+`order: ipv6first`, `family: 0`, `hints: 0`; Node получает AAAA и A без неявного
+ADDRCONFIG-фильтра. `autoSelectFamily: true` включает штатный подбор семейства
+адресов: первым пробуется IPv6, затем IPv4 и остальные адреса. На неуспешную
+попытку до следующего адреса выделяется 250 мс, общий connect timeout — 10 секунд.
+При немедленной ошибке, например ENETUNREACH, переход выполняется сразу. Если
+есть только A-записи или рабочий IPv4, запросы продолжают работать через IPv4.
+Это алгоритм Node для установления TCP-соединения; он не повторяет запрос по
+другому семейству при HTTP-ошибке или после уже установленного TCP/TLS соединения.
+
+Адреса Telegram не зафиксированы в коде и читаются из DNS при новом соединении;
+открытые соединения переиспользуются. URL остаётся `https://api.telegram.org`, SNI
+и проверка сертификата по этому имени сохраняются (`rejectUnauthorized: true`).
+Глобальные DNS/fetch defaults, PostgreSQL и IPv4 ОС не меняются. `NODE_OPTIONS`,
+`NODE_TLS_REJECT_UNAUTHORIZED=0`, VPN и proxy для этого решения не нужны.
+
+Временные сетевые ошибки при начальном `getMe`/`getWebhookInfo` теперь повторяются
+с backoff так же, как polling, без цикла перезапуска контейнера. Пока связи нет,
+`/health` отвечает 503. При SIGTERM ожидание прерывается, Agent закрывается. Логи
+содержат только разрешённые `network_codes` (например UND_ERR_CONNECT_TIMEOUT,
+ENETUNREACH, ENOTFOUND), без URL с токеном или текста исходной ошибки.
+
+### Проверка сети именно внутри контейнера
+
+Успешный `curl -6` на хосте не доказывает IPv6-доступность из Docker bridge.
+Базовый `docker-compose.yml` не включает IPv6 для default bridge. Само наличие
+AAAA в DNS тоже не означает, что у контейнера есть IPv6-адрес и маршрут наружу.
+На VPS сначала соберите новую версию и проверьте её без запуска второго poller:
+
+```bash
+docker compose build
+docker compose run --rm --no-deps application node dist/telegram/network-check.js
+```
+
+Диагностика делает только `HEAD https://api.telegram.org/`, без bot token,
+Bot API методов и перехода по редиректам. Она выводит DNS-адреса и результат
+для IPv4-only, IPv6-only и того же IPv6-first/fallback транспорта, что у бота.
+Ответ HTTP (в том числе 302) означает успешное TCP/TLS/HTTP-соединение; это не
+проверка credentials. Код выхода 0 означает успех режима с fallback, 1 — его
+неудачу. Принудительная проверка недоступного семейства может занять 12 секунд.
+
+Для default project network (если меняли project name, используйте его имя):
+
+```bash
+docker network inspect profkarniz_default --format '{{.EnableIPv6}}'
+```
+
+Если host IPv6 работает, а bridge IPv6 — нет, для этого небольшого сервиса есть
+готовый вариант ниже. Другой вариант — корректно настроенная dual-stack bridge
+с IPv6 IPAM, forwarding и IPv6 masquerading/маршрутизацией. Одного
+`enable_ipv6: true` недостаточно для гарантии внешнего доступа на любом VPS;
+после сетевых изменений всё равно запускайте диагностику **в контейнере**.
+
+### Готовый Linux-вариант без изменения Docker daemon или системного IPv4
+
+`docker-compose.host-network.yml` подключает **только application** к сети Linux
+хоста. Так приложение использует тот же IPv6-маршрут, по которому работает
+`curl -6` хоста. PostgreSQL и мигратор сохраняют bridge-сеть. Для приложения
+PostgreSQL публикуется только на `127.0.0.1:${HOST_POSTGRES_PORT:-55432}`;
+HTTP также слушает только `127.0.0.1:${HTTP_PORT:-3000}`. Публичных bind-адресов
+`0.0.0.0`/`::` этот override не добавляет. Healthcheck учитывает выбранный HTTP_PORT.
+
+Нужны Linux Docker Engine >= 28 и Compose >= 2.24.4 (поддержка `!reset`). Этот
+вариант уменьшает сетевую изоляцию application: процесс видит сетевые сервисы
+хоста. Read-only filesystem, непривилегированный пользователь и cap_drop остаются.
+Он не требуется машинам с рабочим IPv4 или уже настроенной IPv6 bridge.
+Не смешивайте его с `docker-compose.dev.yml`.
+
+До переключения можно проверить IPv6 через host network, не останавливая сервис:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
+  run --rm --no-deps application node dist/telegram/network-check.js
+```
+
+Если режим `ipv6first-with-fallback` успешен, выберите свободные порты
+HOST_POSTGRES_PORT/HTTP_PORT в `.env` и выполните из **того же каталога проекта**:
+
+```bash
+docker compose stop application
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml up -d
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml ps -a
+curl -i http://127.0.0.1:3000/health
+```
+
+Команда предполагает, что `docker compose build` из шага выше уже выполнена.
+Если HTTP_PORT отличается от 3000, подставьте его в curl. PostgreSQL будет
+пересоздан для публикации loopback-порта; заранее выберите короткое окно
+обслуживания. Имя Compose-проекта и persistent volume остаются прежними, миграции
+данных для этой правки не нужны. Не используйте `down -v` и не меняйте project name.
+Если ранее задавали `-p`, сохраняйте тот же `-p` во всех командах.
+
+После переключения используйте оба `-f` при каждом `up`, `run` и обновлении, чтобы
+случайно не вернуть bridge networking. Обновление: build с обоими файлами, затем
+stop application и up -d с обоими файлами. Для возврата на базовый bridge:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml stop application
+docker compose -f docker-compose.yml up -d
+```
+
+Возвращайтесь к bridge только если его IPv4 или IPv6-доступ к Telegram проверен.
+VPS firewall и ограничения провайдера могут по-прежнему влиять на соединения;
+диагностика и `/health` показывают фактический результат после развёртывания.
 
 ## Локальный запуск Node.js
 
@@ -273,6 +387,7 @@ docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -
 
 ```bash
 npm run check                # typecheck + lint + unit tests + build
+npm run test:compose         # проверка base/host-network Compose без старта сервисов
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from tests
 docker compose -f docker-compose.test.yml down
 ```
@@ -285,6 +400,15 @@ Production `.env` и реальный Telegram token для тестов не н
 конкурирующие повторы, редакции, альбомы, rollback, immutable triggers и lock.
 Linux process test запускает собранное приложение с mock Telegram transport,
 проверяет запись, HTTP health и корректный SIGTERM. Реальные сообщения не отправляются.
+
+Сетевые тесты используют реальные локальные сокеты IPv4/IPv6 и Node fetch с тем
+же Agent: IPv6-first, отказ IPv6 с fallback на IPv4, только A или только AAAA.
+Публичный DNS и Telegram для них не нужны; достаточно IPv6 loopback. Тестовый
+Compose включает его только внутри тестового контейнера через namespaced sysctl.
+Process test также имитирует начальный UND_ERR_CONNECT_TIMEOUT и проверяет
+восстановление в том же процессе. `test:compose` требует Docker Compose, проверяет
+loopback bind, custom ports, host-mode только у application и сохранение имени
+volume; полный config с секретами не печатается. Эти проверки также запускаются CI.
 
 Для существующей тестовой PostgreSQL задайте `TEST_DATABASE_URL` через окружение
 и выполните `npm run build && npm run test:integration`. Без URL тесты завершаются
@@ -322,3 +446,7 @@ SELECT/INSERT/UPDATE для cursor и доступ к sequences; DDL нужен 
 - [Ограничения доставки Telegram updates](https://core.telegram.org/bots/api#getting-updates)
 - [Telegram Privacy Mode](https://core.telegram.org/bots/features#privacy-mode)
 - [Kysely migrations](https://kysely.dev/docs/migrations)
+- [Node.js 24 DNS order](https://nodejs.org/docs/latest-v24.x/api/dns.html#dnslookuphostname-options-callback)
+- [Node.js autoSelectFamily](https://nodejs.org/docs/latest-v24.x/api/net.html#socketconnectoptions-connectlistener)
+- [Undici connector options](https://github.com/nodejs/undici/blob/main/docs/docs/api/Connector.md)
+- [Docker host networking](https://docs.docker.com/engine/network/drivers/host/)

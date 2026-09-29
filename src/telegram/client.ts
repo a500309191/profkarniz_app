@@ -1,7 +1,9 @@
 import { object, type TelegramUpdate } from './normalize.js';
+import { createTelegramDispatcher, networkErrorCodes, TELEGRAM_ORIGIN } from './transport.js';
 
 export class TelegramError extends Error {
-  constructor(readonly code: number | 'NETWORK' | 'INVALID_RESPONSE', readonly retryAfter = 0) {
+  constructor(readonly code: number | 'NETWORK' | 'INVALID_RESPONSE', readonly retryAfter = 0,
+    readonly networkCodes: string[] = []) {
     super('Telegram API request failed');
   }
   get fatal() { return [400, 401, 403, 404, 409].includes(Number(this.code)); }
@@ -12,21 +14,27 @@ export interface TelegramApi {
 }
 
 export class TelegramClient implements TelegramApi {
+  private readonly dispatcher = createTelegramDispatcher();
+
   constructor(
     private readonly token: string,
     private readonly pollTimeoutSeconds: number,
     private readonly fetcher: typeof fetch = fetch
   ) {}
 
+  async close() { await this.dispatcher.close(); }
+
   // This allowlist is deliberately read-only. No send/delete/reaction methods.
   private async request(method: 'getMe' | 'getWebhookInfo' | 'getUpdates',
     body: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
     const timeout = method === 'getUpdates' ? (this.pollTimeoutSeconds + 10) * 1000 : 15_000;
     try {
-      const response = await this.fetcher(`https://api.telegram.org/bot${this.token}/${method}`, {
+      const requestOptions = {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body), signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)])
-      });
+        body: JSON.stringify(body), signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
+        dispatcher: this.dispatcher
+      };
+      const response = await this.fetcher(`${TELEGRAM_ORIGIN}/bot${this.token}/${method}`, requestOptions);
       let data;
       try { data = object(await response.json()); }
       catch { throw new TelegramError(response.ok ? 'INVALID_RESPONSE' : response.status); }
@@ -43,7 +51,7 @@ export class TelegramClient implements TelegramApi {
       if (signal.aborted) throw new Error('SHUTTING_DOWN');
       if (error instanceof TelegramError) throw error;
       // Fetch errors may contain the token in the URL; never propagate them.
-      throw new TelegramError('NETWORK');
+      throw new TelegramError('NETWORK', 0, networkErrorCodes(error));
     }
   }
 

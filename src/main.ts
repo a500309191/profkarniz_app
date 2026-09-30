@@ -10,6 +10,10 @@ import { createHealthServer } from './http/health.js';
 import { applicationErrorCode, createLogger, databaseErrorCode } from './logger.js';
 import { TelegramClient, TelegramError } from './telegram/client.js';
 import { collect, verifyTelegram, type CollectorState } from './telegram/collector.js';
+import { MediaRepository } from './media/repository.js';
+import { createS3Client, S3Archive } from './media/s3.js';
+import { runMediaWorker } from './media/worker.js';
+import type { MediaHealth } from './media/types.js';
 
 async function main(config: Config) {
   const logger = createLogger(config.LOG_LEVEL);
@@ -17,10 +21,15 @@ async function main(config: Config) {
   const state: CollectorState = { phase: 'starting', lastSuccessAt: null, lastError: null };
   const pool = createPool(config);
   const db = createDatabase(pool);
+  const mediaState: MediaHealth = { status: config.media.enabled ? 'degraded' : 'disabled', pending: 0,
+    failed: 0, last_scan_at: null, last_error_code: null };
   const server = createHealthServer({ state, staleSeconds: config.HEALTH_STALE_SECONDS,
+    media: mediaState,
     checkDatabase: async () => { await sql`SELECT 1`.execute(db); } });
   let lock: Awaited<ReturnType<typeof acquireCollectorLock>> | undefined;
   let api: TelegramClient | undefined;
+  let mediaTask: Promise<void> | undefined;
+  let s3: ReturnType<typeof createS3Client> | undefined;
   let shutdownTimer: ReturnType<typeof setTimeout> | undefined;
 
   const stop = (reason: string, failed = false) => {
@@ -55,6 +64,13 @@ async function main(config: Config) {
     const botId = await verifyTelegram({ api, state, signal: controller.signal, logger });
     if (botId === null || controller.signal.aborted) return;
     lock = await acquireCollectorLock(pool, botId, () => stop('collector_lock_lost', true));
+    if (config.media.enabled) {
+      const repository = new MediaRepository(db, botId, config.media);
+      await repository.initialize();
+      s3 = createS3Client(config.media.s3);
+      mediaTask = runMediaWorker({ repository, files: api, storage: new S3Archive(s3), config: config.media,
+        state: mediaState, signal: controller.signal, logger, assertLeadership: () => lock!.assertHeld() });
+    }
     await collect({ api, store: new TelegramStore(db, botId), state,
       signal: controller.signal, logger, assertLeadership: () => lock!.assertHeld() });
   } catch (error) {
@@ -67,6 +83,8 @@ async function main(config: Config) {
   } finally {
     if (!controller.signal.aborted) stop('collector_stopped');
     await new Promise<void>(resolve => server.close(() => resolve()));
+    await mediaTask;
+    s3?.destroy();
     await api?.close();
     lock?.release();
     await db.destroy();

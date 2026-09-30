@@ -1,10 +1,11 @@
-# ProfKarniz App — milestone 1
+# ProfKarniz App — milestone 1.5
 
 Пассивный сборщик новых Telegram-сообщений для внутренней системы ПРОФКАРНИЗ.
-Node.js 24 + TypeScript + PostgreSQL 17. Один процесс выполняет long polling и
-предоставляет `GET /health`. Бот ничего не отправляет, не редактирует, не удаляет,
+Node.js 24 + TypeScript + PostgreSQL 17 + приватный Selectel S3. Один процесс выполняет long polling,
+опционально архивирует вложения и предоставляет `GET /health`. Бот ничего не отправляет, не редактирует, не удаляет,
 не отвечает и не ставит реакции. В клиенте доступны только `getMe`, `getWebhookInfo`
-и `getUpdates`.
+`getUpdates` и `getFile`, а также скачивание файлов. Архивирование включается явно;
+при `MEDIA_ARCHIVE_ENABLED=false` S3 credentials не нужны.
 
 ## Архитектура и гарантии
 
@@ -22,6 +23,14 @@ telegram_polling_state    сохранённая позиция polling
         │ COMMIT
         ▼
 следующий getUpdates(offset) подтверждает только сохранённые updates
+
+отдельный worker читает только COMMIT-нутые telegram_message_events
+        │
+telegram_media_objects    durable jobs + результат, UNIQUE(event_id, attachment_index)
+        │ короткий COMMIT, затем без открытой транзакции БД
+getFile → download stream → SHA-256 / size → private S3 PutObject
+        │
+telegram_media_objects    archived + bucket/key/size/hash/etag
 ```
 
 Доставка допускает повторы, запись идемпотентна. Если процесс падает до COMMIT,
@@ -50,7 +59,9 @@ forward origin и служебные события. JSONB сохраняет з
 reply ID, thread ID, album ID, forward metadata. Для фото сохраняются все размеры,
 для документов, видео, voice, audio, animation, sticker и video_note — file_id,
 file_unique_id, исходная metadata, thumbnails и дополнительные поля. Неизвестные
-типы всегда остаются в raw update. Вложения не скачиваются.
+типы всегда остаются в raw update. При включённом архиве поддерживаемые вложения
+скачиваются отдельным worker; ошибка S3 не откатывает raw update и не задерживает
+подтверждение polling.
 
 Альбомы сохраняются отдельными сообщениями с `media_group_id`; связывать их нужно
 в контексте бота и чата. Вложенный reply хранится в raw update, но не создаёт
@@ -82,7 +93,7 @@ PostgreSQL явными. Встроенный Migrator ведёт таблицу
 Bundle сможет ссылаться на IDs сообщений и конкретных событий. Предсказания parser
 и человеческие исправления следует хранить в отдельных новых таблицах с версиями
 parser и ссылками на исходные события, чтобы получать dataset
-`raw input → parser prediction → human ground truth`. В milestone 1 этих сущностей,
+`raw input → parser prediction → human ground truth`. В milestone 1.5 этих сущностей,
 парсера заказов, AI/LLM, CRM и frontend нет.
 
 ## Структура
@@ -105,6 +116,14 @@ src/
     migrations.ts           versioned migration provider
     migrate.ts              отдельная команда миграции
     migrations/001_*.ts     начальная схема и immutable triggers
+    migrations/002_*.ts     media jobs и cursor обнаружения вложений
+  media/
+    discovery.ts            выбор вложений и безопасные детерминированные keys
+    repository.ts           jobs, leases, recovery, backfill
+    archive.ts, streams.ts  bounded streaming, SHA-256, reconciliation
+    s3.ts                   AWS SDK v3, private conditional PUT, HEAD/GET
+    worker.ts, errors.ts    concurrency, backoff, safe error codes
+    config.ts, cli.ts       feature flag, s3-check/backfill/retry-failed
   http/health.ts            GET /health
 tests/                      unit, настоящий PostgreSQL и Linux process smoke test
 docker-compose.yml          application + PostgreSQL + one-shot migrate
@@ -132,6 +151,16 @@ docker-compose.test.yml     изолированные тесты без реа�
 | `HEALTH_STALE_SECONDS` | `120` | Допустимый возраст успешного цикла, 60–3600 секунд |
 | `SHUTDOWN_TIMEOUT_SECONDS` | `25` | Deadline завершения, 5–120 секунд |
 | `TEST_DATABASE_URL` | нет | Только integration tests, имя БД должно кончаться `_test` |
+| `MEDIA_ARCHIVE_ENABLED` | `false` | Строго `true`/`false`; включает worker |
+| `S3_ENDPOINT` | нет | HTTPS origin без пути, credentials, query/hash; в примере `https://s3.ru-7.storage.selcloud.ru` |
+| `S3_REGION` | нет | Регион, для production `ru-7` |
+| `S3_BUCKET` | нет | Уже созданный **private** bucket, для production `profkarniz-storage` |
+| `S3_ACCESS_KEY_ID` | нет | Ключ доступа, только environment |
+| `S3_SECRET_ACCESS_KEY` | нет | Секретный ключ, только environment |
+| `MEDIA_CONCURRENCY` | `2` | Одновременные jobs, 1–4 |
+| `MEDIA_MAX_ATTEMPTS` | `5` | Попытки на job до `failed`, 1–20 |
+| `MEDIA_JOB_TIMEOUT_SECONDS` | `180` | Общий deadline одной попытки, 1–1800 секунд |
+| `MEDIA_MAX_FILE_BYTES` | `20971520` | Верхняя граница файла, не выше 20 MiB |
 
 Все секреты поступают через environment variables. `.env` — локальный способ
 задать их, исключённый из Git и Docker build context; Compose передаёт сервисам
@@ -149,6 +178,10 @@ nano .env
 Не публикуйте вывод `docker compose config`, `docker inspect` или env: они могут
 показывать секреты. Приложение не пишет API descriptions, HTTP URLs, SQL params,
 stack traces с исходными ошибками или полный текст сообщений в логи.
+
+При включении media все пять `S3_*` обязательны и проверяются при старте.
+При выключении не создаётся S3 client, не запускается media worker и не изменяются
+существующие media jobs. Миграция 002 всё равно нужна новой версии приложения.
 
 ## Запуск на Ubuntu VPS через Docker Compose
 
@@ -302,6 +335,198 @@ docker compose -f docker-compose.yml up -d
 VPS firewall и ограничения провайдера могут по-прежнему влиять на соединения;
 диагностика и `/health` показывают фактический результат после развёртывания.
 
+## Media archive → Selectel S3
+
+### Данные и выбор файлов
+
+Raw Telegram metadata остаётся source of truth в PostgreSQL. Миграция
+`002_media_archive` добавляет две таблицы, не меняя immutable updates/events:
+
+- `telegram_media_objects`: отдельная запись на event/attachment, Telegram file IDs,
+  исходное имя/MIME/reported size, сохранённые endpoint/bucket/key, downloaded size,
+  SHA-256, ETag, статус, даты, число попыток, безопасный error code, срок следующей
+  попытки и lease/token текущего исполнителя.
+- `telegram_media_discovery`: cursor событий для каждого bot_id. При первом
+  включении он начинается с последнего уже сохранённого события; старые события
+  добавляются командой backfill. При последующих стартах продолжается сохранённый
+  cursor, поэтому ещё не обнаруженная работа после предыдущего запуска не теряется.
+
+Worker архивирует `photo`, `document`, `video`, `voice`, `audio`, `animation`,
+`video_note`. Для photo выбирается наибольшая площадь width × height, при равенстве —
+больший file_size. Все PhotoSize и thumbnail metadata сохраняются в исходном event,
+но thumbnails отдельно не скачиваются. Дублирующий document той же animation
+не создаёт второй архив. Sticker и неизвестные media остаются в raw без job.
+Альбом обрабатывается как отдельные события его сообщений.
+
+Ключ объекта имеет вид:
+
+```text
+telegram/<bot_id>/<chat_id>/<UTC YYYY>/<MM>/<message_id>/events/<event_id>/<attachment_index>-<safe_file_unique_id>.<ext>
+```
+
+Event ID разделяет редакции сообщения и business contexts. Одинаковый файл в
+разных сообщениях получает отдельные связи и объекты; глобальной дедупликации нет.
+Attachment index соответствует массиву metadata исходного event. Если unique ID
+отсутствует или содержит небезопасные символы, используется SHA-256 его значения
+либо file_id (это хеш идентификатора, отдельный от хеша содержимого).
+Имя пользователя никогда не становится путём: используется только проверенное
+короткое расширение, затем MIME, иначе `.bin` (в том числе для PhotoSize без имени/MIME).
+Путь `getFile.file_path` применяется только к текущему download и не записывается
+в media records; URL с bot token нигде не сохраняется и не логируется.
+
+### Streaming, retries и восстановление
+
+Официальный cloud Bot API позволяет скачать через `getFile` файлы до 20 MB;
+приложение ограничивает поток 20 MiB, а отказ Telegram на его границе обрабатывает
+как ошибку конкретного файла. Лимит приложения можно уменьшить. Для больших файлов
+сохраняется raw/metadata и `failed` с `MEDIA_TOO_LARGE` либо
+`TELEGRAM_FILE_UNAVAILABLE`. Это не останавливает collector.
+Срок действия download URL ограничен; каждая новая попытка вызывает `getFile` заново.
+[Ограничения Telegram getFile](https://core.telegram.org/bots/api#getfile).
+
+При известной длине работает pipeline `Telegram stream → hash/count → S3 stream`.
+Файл не собирается в Buffer; backpressure ограничивает буферы. Если ни getFile,
+ни HTTP не сообщили длину, worker сначала пишет ограниченный по размеру поток во
+временный файл, затем передаёт его одним потоковым PUT с известным Content-Length.
+В Compose `/tmp` — ограниченный tmpfs 128 MiB: редкий spool расходует до
+`concurrency × max_file_bytes` (40 MiB при defaults, максимум 80 MiB), плюс буферы.
+В обычном Node.js используется системный temp directory. Временный файл удаляется
+после попытки; tmpfs очищается при пересоздании контейнера. Недостаток места не
+теряет job. Concurrency по умолчанию 2, максимум 4 для VPS с 2 GB RAM.
+
+Размер cloud Telegram файлов позволяет использовать один `PutObject` без multipart,
+`AbortMultipartUpload` и `DeleteObject`. SDK не повторяет уже прочитанный stream:
+повторами управляет очередь в PostgreSQL. SHA-256 вычисляется по полученным байтам;
+ETag сохраняется отдельно и не считается SHA-256.
+
+Состояния: `pending → downloading → uploading → archived`. Ошибка переводит job
+в `pending` с `next_attempt_at` либо в `failed`. Claim и смены состояния — короткие
+транзакции; Telegram/S3 I/O выполняются после их завершения. Индексы покрывают
+pending jobs, leases и состояние по bot_id. `FOR UPDATE SKIP LOCKED` и attempt token
+защищают job от конкурентного claim и записи результата устаревшей попыткой.
+Worker использует существующий bot advisory lock вместе с collector.
+
+Network, Telegram 429 и S3 5xx повторяются с exponential backoff от 5 секунд и
+jitter 0.5–1.5; базовая задержка ограничена часом, учитывается Telegram retry_after.
+После `MEDIA_MAX_ATTEMPTS` job становится `failed`. Telegram invalid file и S3
+401/403 не повторяются автоматически. При SIGTERM потоки прерываются, job
+возвращается в pending без расходования попытки. После аварийного завершения
+новый владелец advisory lock восстанавливает активные jobs; зависшие leases
+также возвращаются в очередь по сроку. Pending jobs и их retry dates сохраняются.
+
+Перед скачиванием worker делает HEAD детерминированного ключа. PUT содержит
+`If-None-Match: *` и техническую metadata `archive-id`. Если upload завершился,
+но запись в БД не подтвердилась, следующая попытка сверяет archive-id, читает
+существующий объект потоком, вычисляет SHA-256/size и отмечает job `archived`.
+Другой archive-id даёт `S3_IDENTITY_MISMATCH`; чужой объект не перезаписывается.
+Конфликт условной записи повторяется через ту же сверку. Повтор не создаёт новый key.
+Смена настроенных endpoint/bucket не переносит старые jobs: они сохраняют назначение
+и дают `S3_DESTINATION_CHANGED`, пока соответствующая настройка не восстановлена.
+
+### Private bucket и права
+
+Создайте bucket `profkarniz-storage` как **private**, без публичной bucket policy.
+Приложению нужны только:
+
+| Право | Область |
+| --- | --- |
+| `s3:ListBucket` | bucket `profkarniz-storage`; проверка `s3:check` |
+| `s3:GetObject` | `telegram/*` и `test/*`; HEAD/GET и reconciliation |
+| `s3:PutObject` | `telegram/*` и `test/*`; архив и техническая проверка |
+
+Права DeleteObject, ACL, создание bucket и управление lifecycle не нужны.
+Приложение не публикует объекты, не создаёт presigned/public URLs и не предоставляет
+endpoint чтения файлов. Приватность существующей bucket policy контролируется
+в Selectel: команда доступа не меняет и не проверяет её. AWS SDK v3 использует
+path-style, SigV4 и TLS verification; Selectel поддерживает conditional writes.
+[Selectel S3 compatibility](https://docs.selectel.ru/en/api/object-storage-s3/).
+
+### Обновление production с существующим host-network
+
+Сохраните backup PostgreSQL. В защищённом `.env` добавьте параметры из `.env.example`:
+endpoint `https://s3.ru-7.storage.selcloud.ru`, region `ru-7`, bucket
+`profkarniz-storage`, обе реальные S3 credentials через редактор и
+`MEDIA_ARCHIVE_ENABLED=true`. Не копируйте новый `.env.example` поверх рабочего `.env`.
+
+Из того же каталога и с прежним Compose project name:
+
+```bash
+git pull --ff-only
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml build
+# Проверка только S3: не запускает poller, не отправляет пользовательские данные.
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
+  run --rm --no-deps application node dist/media/cli.js s3-check
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml stop application
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml run --rm migrate
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml up -d application
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml logs --tail=100 application
+curl -i http://127.0.0.1:3000/health
+```
+
+Первую S3-проверку можно выполнить и с `MEDIA_ARCHIVE_ENABLED=false`: CLI проверяет
+все пять S3-переменных независимо от flag, без Telegram/БД. Она выполняет ListObjectsV2
+для `test/`, записывает маленький технический объект `test/access-check-<UUID>.txt`,
+проверяет HEAD и GET/hash. Код выхода 0 означает успех. **Объект остаётся в `test/`**,
+каждый запуск создаёт новый; автоматического удаления нет. В лог попадает только
+технический key и результат, без credentials и подписей запросов.
+
+Для bridge deployment используйте те же команды без обоих `-f` аргументов.
+IPv6-first Telegram Agent применяется также к getFile/download, host-network override
+сохранён. После обновления проверьте свежие photo/document/video/voice: raw commit,
+`media_archived` и metadata в БД. S3 доступ с production VPS подтверждает именно
+его `s3-check`; mock tests не заменяют эту проверку.
+
+### Backfill и ручной повтор
+
+При работающем media worker создайте jobs из ранее сохранённых событий:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
+  run --rm --no-deps application node dist/media/cli.js backfill
+```
+
+Команда требует `MEDIA_ARCHIVE_ENABLED=true`, работает только с bot_id из текущего
+токена и сканирует события до зафиксированного в начале max ID пакетами по 100.
+Она только добавляет недостающие pending records: не скачивает файлы, не меняет
+raw/history и не перемещает live cursor. Повторный запуск безопасен; archived и
+failed записи не сбрасываются. Обработку продолжает основной worker. Backfill
+можно прервать и запустить снова. Он не запрашивает старую историю у Telegram.
+
+После исправления credentials, прав или причины permanent error:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
+  run --rm --no-deps application node dist/media/cli.js retry-failed
+```
+
+Команда сбрасывает только failed jobs текущего bot_id в pending и обнуляет число
+попыток. Она не затрагивает archived/active jobs и не меняет их ключи назначения.
+Просто рестарт приложения не сбрасывает failed. При временном отключении feature
+сохранённые jobs остаются в БД, продолжение начинается после включения.
+
+Локальные npm-команды читают уже заданное окружение:
+
+```bash
+npm run s3:check
+npm run media:backfill
+npm run media:retry-failed
+```
+
+Для `.env` и собранного кода: `node --env-file=.env dist/media/cli.js s3-check`
+(либо `backfill` / `retry-failed`). В runtime Docker image используйте `node dist/...`,
+как выше: dev dependency `tsx` в нём отсутствует. Секреты не передаются аргументами.
+
+Проверка состояния без имён файлов и текста сообщений:
+
+```bash
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT archive_status, count(*) FROM telegram_media_objects GROUP BY archive_status;"'
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT id, archive_status, downloaded_size, sha256, attempt_count, last_error_code FROM telegram_media_objects ORDER BY id DESC LIMIT 20;"'
+```
+
+Бинарные файлы лежат только в S3; SQL содержит ссылку на конкретный event/attachment
+и результат архивирования. Backup PostgreSQL и сохранность приватных S3 objects
+нужно обеспечивать совместно. Удаление и lifecycle policies этим milestone не управляются.
+
 ## Локальный запуск Node.js
 
 Нужны Node.js 24, npm и PostgreSQL 17 (можно поднять только БД в Docker).
@@ -360,19 +585,28 @@ Bot API не предоставляет всю историю группы и н
 curl -i http://127.0.0.1:3000/health
 ```
 
-`200`: БД отвечает, последний цикл polling успешно завершён недавно, ошибок нет.
+`200`: БД отвечает, последний цикл polling успешно завершён недавно.
 Пустой успешный ответ Telegram тоже подтверждает работоспособность.
 `503`: запуск, retry, остановка, ошибка/таймаут БД или устаревший polling.
 При первом запуске 503 может сохраняться до завершения первого long poll.
 
 ```json
-{"status":"ok","database":"up","collector":{"phase":"running","healthy":true,"last_success_at":"2026-09-30T00:00:00.000Z","last_error":null}}
+{"status":"ok","database":"up","collector":{"phase":"running","healthy":true,"last_success_at":"2026-09-30T00:00:00.000Z","last_error":null},"media_archive":{"status":"ok","pending":0,"failed":0,"last_scan_at":"2026-09-30T00:00:00.000Z","last_error_code":null}}
 ```
+
+`media_archive` независимо сообщает `disabled`, `ok` или `degraded`, количество
+незавершённых (включая active) и failed jobs. Ошибки media и отсутствие свежего
+scan более 30 секунд дают degraded, но не меняют HTTP 200 здорового collector.
+Данные media берутся из последнего прохода worker; HTTP health не обращается к S3.
+`ok` без jobs не является активной проверкой S3 credentials — для неё есть `s3:check`.
 
 Health содержит только техническое состояние. Structured JSON logs содержат
 события старта, соединения с БД, polling, количество полученных/сохранённых
 updates и дублей, категории ошибок и retry delay. Тексты, имена отправителей,
 file_id и содержимое raw update в production logs не выводятся.
+Media-события: `media_discovered`, `media_download_started`, `media_upload_started`,
+`media_archived`, `media_retry`, `media_failed`; только internal IDs, тип, размер,
+duration, число попыток и безопасные error codes. Исходные исключения SDK не печатаются.
 Настройте внешнюю проверку loopback endpoint через VPS-мониторинг. Docker помечает
 нездоровый контейнер, но сам по себе **не перезапускает** контейнер из-за healthcheck;
 restart policy применяется к выходу процесса. Временные ошибки процесс повторяет.
@@ -410,6 +644,15 @@ Process test также имитирует начальный UND_ERR_CONNECT_TI
 loopback bind, custom ports, host-mode только у application и сохранение имени
 volume; полный config с секретами не печатается. Эти проверки также запускаются CI.
 
+Media tests проверяют key/path safety, extensions, photo selection, discovery,
+feature flag, Telegram download через тот же dispatcher, bounded streams/SHA-256,
+retry/backoff, безопасные ошибки и восстановление после сбоя. Локальный HTTP S3 mock
+принимает настоящие SigV4-запросы AWS SDK и имитирует потерю ответа после PUT;
+проверяются HEAD/GET reconciliation, private conditional PUT и `s3:check` без DELETE.
+PostgreSQL tests проверяют jobs, backfill, дубли, редакции, leases/fencing, restart,
+ручной retry и ограничение concurrency при продолжающейся записи raw updates.
+CI не обращается к реальному Telegram/Selectel и не требует S3 credentials.
+
 Для существующей тестовой PostgreSQL задайте `TEST_DATABASE_URL` через окружение
 и выполните `npm run build && npm run test:integration`. Без URL тесты завершаются
 ошибкой, а не пропускаются. Имя БД должно оканчиваться `_test`; тесты создают и
@@ -436,7 +679,7 @@ backup/PITR для требуемой допустимой потери данн
 
 Compose для простоты использует одного DB owner для миграций и приложения. При
 усилении эксплуатации разделите роли: runtime нужны SELECT/INSERT для истории,
-SELECT/INSERT/UPDATE для cursor и доступ к sequences; DDL нужен только мигратору.
+SELECT/INSERT/UPDATE для cursor, media jobs/discovery и доступ к sequences; DDL нужен только мигратору.
 Не открывайте PostgreSQL публично; для внешней БД настройте проверяемый TLS/сеть
 отдельно. Реальные credentials и настройки конкретного VPS в репозиторий не входят.
 
@@ -450,3 +693,5 @@ SELECT/INSERT/UPDATE для cursor и доступ к sequences; DDL нужен 
 - [Node.js autoSelectFamily](https://nodejs.org/docs/latest-v24.x/api/net.html#socketconnectoptions-connectlistener)
 - [Undici connector options](https://github.com/nodejs/undici/blob/main/docs/docs/api/Connector.md)
 - [Docker host networking](https://docs.docker.com/engine/network/drivers/host/)
+- [Telegram getFile](https://core.telegram.org/bots/api#getfile)
+- [Selectel S3 API и совместимость](https://docs.selectel.ru/en/api/object-storage-s3/)

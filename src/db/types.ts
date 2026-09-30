@@ -1,10 +1,13 @@
 import type { ColumnType, Generated } from 'kysely';
 import type { JsonObject, NormalizedMessage } from '../telegram/normalize.js';
+import type { MediaObjectTable } from '../media/types.js';
 
 type BigId = ColumnType<string, string, never>;
 type JsonColumn<T> = ColumnType<T, string, never>;
 
 export interface Database {
+  telegram_media_objects: MediaObjectTable;
+  telegram_media_discovery: { bot_id: string; last_event_id: string };
   telegram_updates: {
     id: Generated<string>;
     bot_id: BigId;

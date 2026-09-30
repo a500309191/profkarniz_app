@@ -2,10 +2,11 @@ import { once } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import { createHealthServer } from '../../src/http/health.js';
 import type { CollectorState } from '../../src/telegram/collector.js';
+import type { MediaHealth } from '../../src/media/types.js';
 
-async function check(state: CollectorState, databaseUp = true, path = '/health') {
+async function check(state: CollectorState, databaseUp = true, path = '/health', media?: MediaHealth) {
   const server = createHealthServer({ state, staleSeconds: 120, now: () => 200_000,
-    checkDatabase: async () => { if (!databaseUp) throw new Error('sensitive database detail'); } });
+    ...(media ? { media } : {}), checkDatabase: async () => { if (!databaseUp) throw new Error('sensitive database detail'); } });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const address = server.address();
@@ -36,5 +37,16 @@ describe('/health', () => {
   });
   it('returns 404 outside /health', async () => {
     expect((await check(running, true, '/messages')).status).toBe(404);
+  });
+  it('reports cached media degradation separately without affecting healthy polling', async () => {
+    expect(await check(running, true, '/health', { status: 'degraded', pending: 3, failed: 1,
+      last_scan_at: new Date(195_000).toISOString(), last_error_code: 'MEDIA_JOBS_REQUIRE_RETRY' }))
+      .toMatchObject({ status: 200, body: { status: 'ok', media_archive: { status: 'degraded', pending: 3, failed: 1 } } });
+    expect(await check(running, true, '/health', { status: 'ok', pending: 0, failed: 0,
+      last_scan_at: null, last_error_code: null }))
+      .toMatchObject({ status: 200, body: { media_archive: { status: 'degraded' } } });
+    expect(await check(running, true, '/health', { status: 'disabled', pending: 0, failed: 0,
+      last_scan_at: null, last_error_code: null }))
+      .toMatchObject({ status: 200, body: { media_archive: { status: 'disabled' } } });
   });
 });

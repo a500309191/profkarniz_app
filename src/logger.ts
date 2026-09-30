@@ -6,6 +6,7 @@ export function createLogger(level = 'info') {
     base: { service: 'profkarniz-collector' },
     redact: {
       paths: ['token', 'password', 'TELEGRAM_BOT_TOKEN', 'POSTGRES_PASSWORD',
+        'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY', '*.S3_ACCESS_KEY_ID', '*.S3_SECRET_ACCESS_KEY',
         '*.token', '*.password', 'req.headers.authorization'],
       censor: '[REDACTED]'
     }

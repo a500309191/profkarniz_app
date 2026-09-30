@@ -1,5 +1,9 @@
 import { object, type TelegramUpdate } from './normalize.js';
 import { createTelegramDispatcher, networkErrorCodes, TELEGRAM_ORIGIN } from './transport.js';
+import { Readable } from 'node:stream';
+import type { ReadableStream } from 'node:stream/web';
+import type { FileDownload } from '../media/types.js';
+import { MediaError } from '../media/errors.js';
 
 export class TelegramError extends Error {
   constructor(readonly code: number | 'NETWORK' | 'INVALID_RESPONSE', readonly retryAfter = 0,
@@ -25,7 +29,7 @@ export class TelegramClient implements TelegramApi {
   async close() { await this.dispatcher.close(); }
 
   // This allowlist is deliberately read-only. No send/delete/reaction methods.
-  private async request(method: 'getMe' | 'getWebhookInfo' | 'getUpdates',
+  private async request(method: 'getMe' | 'getWebhookInfo' | 'getUpdates' | 'getFile',
     body: Record<string, unknown>, signal: AbortSignal): Promise<unknown> {
     const timeout = method === 'getUpdates' ? (this.pollTimeoutSeconds + 10) * 1000 : 15_000;
     try {
@@ -51,6 +55,44 @@ export class TelegramClient implements TelegramApi {
       if (signal.aborted) throw new Error('SHUTTING_DOWN');
       if (error instanceof TelegramError) throw error;
       // Fetch errors may contain the token in the URL; never propagate them.
+      throw new TelegramError('NETWORK', 0, networkErrorCodes(error));
+    }
+  }
+
+  async download(fileId: string, signal: AbortSignal, maxBytes: number): Promise<FileDownload> {
+    const file = object(await this.request('getFile', { file_id: fileId }, signal));
+    const path = file?.file_path;
+    if (typeof path !== 'string' || !path || path.split('/').some(part => !/^[A-Za-z0-9_.-]+$/.test(part) || part === '.' || part === '..')) {
+      throw new MediaError('TELEGRAM_FILE_PATH_INVALID', false);
+    }
+    const reportedSize = typeof file?.file_size === 'number' && Number.isSafeInteger(file.file_size) && file.file_size >= 0
+      ? file.file_size : null;
+    if (reportedSize !== null && reportedSize > maxBytes) throw new MediaError('MEDIA_TOO_LARGE', false);
+    try {
+      const options = { signal, dispatcher: this.dispatcher, redirect: 'error' as const };
+      const response = await this.fetcher(`${TELEGRAM_ORIGIN}/file/bot${this.token}/${path.split('/').map(encodeURIComponent).join('/')}`, options);
+      if (!response.ok || !response.body) {
+        await response.body?.cancel();
+        if (response.status === 429) throw new TelegramError(429, Number(response.headers.get('retry-after')) || 1);
+        if (response.status >= 500) throw new TelegramError(response.status);
+        throw new MediaError('TELEGRAM_FILE_UNAVAILABLE', false);
+      }
+      const length = response.headers.get('content-length');
+      const size = length !== null && /^\d+$/.test(length) && Number.isSafeInteger(Number(length)) ? Number(length) : reportedSize;
+      if (size !== null && size > maxBytes) {
+        await response.body.cancel();
+        throw new MediaError('MEDIA_TOO_LARGE', false);
+      }
+      if (size !== null && reportedSize !== null && size !== reportedSize) {
+        await response.body.cancel();
+        throw new MediaError('MEDIA_SIZE_MISMATCH', true);
+      }
+      const body = Readable.fromWeb(response.body as ReadableStream<Uint8Array>);
+      // The worker may await a short DB state change before attaching pipeline.
+      body.on('error', () => {});
+      return { body, size };
+    } catch (error) {
+      if (error instanceof MediaError || error instanceof TelegramError) throw error;
       throw new TelegramError('NETWORK', 0, networkErrorCodes(error));
     }
   }

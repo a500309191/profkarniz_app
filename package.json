@@ -19,9 +19,13 @@
     "test": "vitest run --project unit",
     "test:integration": "vitest run --project integration",
     "test:compose": "node tests/check-compose.mjs",
+    "media:backfill": "tsx src/media/cli.ts backfill",
+    "media:retry-failed": "tsx src/media/cli.ts retry-failed",
+    "s3:check": "tsx src/media/cli.ts s3-check",
     "check": "npm run typecheck && npm run lint && npm test && npm run build"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1143.0",
     "kysely": "0.29.6",
     "pg": "8.23.0",
     "pino": "10.3.1",

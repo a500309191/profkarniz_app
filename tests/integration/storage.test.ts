@@ -13,6 +13,14 @@ import { assertSchemaReady, createMigrator } from '../../src/db/migrations.js';
 import { TelegramStore } from '../../src/db/store.js';
 import type { JsonObject } from '../../src/telegram/normalize.js';
 import { textUpdate } from '../fixtures.js';
+import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
+import pino from 'pino';
+import { MediaRepository } from '../../src/media/repository.js';
+import { archiveJob } from '../../src/media/archive.js';
+import { runMediaWorker } from '../../src/media/worker.js';
+import type { MediaHealth } from '../../src/media/types.js';
+import { mediaConfig, MemoryArchive } from '../media-fixtures.js';
 
 const connectionString = process.env.TEST_DATABASE_URL;
 if (!connectionString) throw new Error('TEST_DATABASE_URL is required; use docker-compose.test.yml');
@@ -25,6 +33,9 @@ const db = createDatabase(pool);
 
 beforeAll(async () => {
   await admin.query(`CREATE SCHEMA "${schema}"`);
+  const initial = await createMigrator(db).migrateTo('001_telegram_ingestion');
+  if (initial.error) throw initial.error;
+  await new TelegramStore(db, '10999').saveBatch([textUpdate]);
   const { error } = await createMigrator(db).migrateToLatest();
   if (error) throw error;
 });
@@ -47,6 +58,8 @@ async function counts(botId: string) {
 describe('PostgreSQL durability and idempotency', () => {
   it('applies versioned migrations once and checks schema at startup', async () => {
     await assertSchemaReady(db);
+    const existing = await db.selectFrom('telegram_updates').select('raw_update').where('bot_id', '=', '10999').executeTakeFirstOrThrow();
+    expect(existing.raw_update).toEqual(textUpdate); // Upgrade from milestone 1 preserves existing history.
     const { results, error } = await createMigrator(db).migrateToLatest();
     expect(error).toBeUndefined();
     expect(results).toHaveLength(0);
@@ -128,7 +141,7 @@ describe('PostgreSQL durability and idempotency', () => {
   it.each(['UPDATE telegram_updates SET update_type = update_type',
     'DELETE FROM telegram_updates', 'TRUNCATE telegram_updates CASCADE',
     'UPDATE telegram_message_events SET text = text', 'DELETE FROM telegram_message_events',
-    'TRUNCATE telegram_message_events'])('rejects history mutation: %s', async statement => {
+    'TRUNCATE telegram_message_events CASCADE'])('rejects history mutation: %s', async statement => {
     await expect(sql.raw(statement).execute(db)).rejects.toThrow('append-only');
   });
 
@@ -156,7 +169,7 @@ it.skipIf(process.platform === 'win32')('runs the actual app, persists a mock up
       POSTGRES_PASSWORD: decodeURIComponent(target.password), POSTGRES_DB: target.pathname.slice(1),
       PGHOST: target.hostname, PGPORT: target.port || '5432', PGOPTIONS: `-c search_path=${schema},public`,
       HTTP_HOST: '127.0.0.1', HTTP_PORT: String(address.port), TELEGRAM_POLL_TIMEOUT_SECONDS: '1',
-      TEST_STARTUP_NETWORK_FAILURE: '1' },
+      TEST_STARTUP_NETWORK_FAILURE: '1', MEDIA_ARCHIVE_ENABLED: 'false' },
     stdio: ['ignore', 'pipe', 'pipe']
   });
   let output = '';
@@ -172,6 +185,8 @@ it.skipIf(process.platform === 'win32')('runs the actual app, persists a mock up
       await delay(100);
     }
     expect(healthy, output).toBe(true);
+    expect(await (await fetch(`http://127.0.0.1:${address.port}/health`)).json())
+      .toMatchObject({ media_archive: { status: 'disabled' } });
     expect(await counts('80001')).toEqual({ updates: 1, messages: 1, events: 1 });
     child.kill('SIGTERM');
     expect((await exit)[0], output).toBe(0);
@@ -184,4 +199,158 @@ it.skipIf(process.platform === 'win32')('runs the actual app, persists a mock up
     if (child.exitCode === null) child.kill('SIGKILL');
     await exit;
   }
+});
+
+const mediaUpdate = { ...textUpdate, message: { ...textUpdate.message as JsonObject,
+  document: { file_id: 'test-document', file_unique_id: 'test-unique', file_name: '../../private.pdf', mime_type: 'application/pdf', file_size: 3 } } };
+const noAbort = new AbortController().signal;
+const mediaLogger = pino({ level: 'silent' });
+const fileBytes = Buffer.from('abc');
+const fileHash = createHash('sha256').update(fileBytes).digest('hex');
+const files = { async download() { return { body: Readable.from([fileBytes]), size: 3 }; } };
+async function mediaRows(botId: string) {
+  return db.selectFrom('telegram_media_objects').selectAll().where('bot_id', '=', botId).orderBy('id').execute();
+}
+
+describe('durable media archive', () => {
+  it('commits raw independently, creates one job on duplicate deliveries and keeps archived jobs out of backfill', async () => {
+    const botId = '11001';
+    const repository = new MediaRepository(db, botId, mediaConfig);
+    await repository.initialize();
+    const store = new TelegramStore(db, botId);
+    await store.saveBatch([mediaUpdate, mediaUpdate]);
+    expect(await mediaRows(botId)).toHaveLength(0); // Raw commit precedes independent discovery.
+    expect(await counts(botId)).toEqual({ updates: 1, messages: 1, events: 1 });
+    expect((await repository.discover()).inserted).toBe(1);
+    expect((await repository.discover()).inserted).toBe(0);
+    const job = (await repository.claim())!;
+    const storage = new MemoryArchive();
+    expect(await archiveJob({ job, repository, files, storage, config: mediaConfig, signal: noAbort, logger: mediaLogger })).toBe(true);
+    expect((await mediaRows(botId))[0]).toMatchObject({ archive_status: 'archived', downloaded_size: '3',
+      sha256: fileHash, s3_etag: 'test-etag', original_filename: '../../private.pdf', attempt_count: 1, attempt_token: null });
+    expect(storage.puts).toBe(1);
+    await store.saveBatch([mediaUpdate]);
+    expect(await repository.backfill(noAbort)).toBe(0);
+    expect(await repository.retryFailed()).toBe(0);
+    expect(await repository.claim()).toBeUndefined();
+    const raw = await db.selectFrom('telegram_updates').select('raw_update').where('bot_id', '=', botId).executeTakeFirstOrThrow();
+    expect(raw.raw_update).toEqual(mediaUpdate);
+    expect(await counts(botId)).toEqual({ updates: 1, messages: 1, events: 1 });
+  });
+
+  it('leaves old history for explicit idempotent backfill, resumes the saved discovery cursor, and isolates bots/edits', async () => {
+    const botId = '11002';
+    const store = new TelegramStore(db, botId);
+    await store.saveBatch([mediaUpdate]);
+    const repository = new MediaRepository(db, botId, mediaConfig);
+    await repository.initialize();
+    expect((await repository.discover()).inserted).toBe(0);
+    expect(await repository.backfill(noAbort)).toBe(1);
+    expect(await repository.backfill(noAbort)).toBe(0);
+    await store.saveBatch([{ update_id: 102, edited_message: { ...mediaUpdate.message, edit_date: 1_750_000_100 } }]);
+    const restarted = new MediaRepository(db, botId, mediaConfig);
+    await restarted.initialize();
+    expect((await restarted.discover()).inserted).toBe(1);
+    expect(new Set((await mediaRows(botId)).map(row => row.s3_key)).size).toBe(2);
+    expect((await mediaRows(botId)).every(row => row.telegram_file_unique_id === 'test-unique')).toBe(true);
+    expect(await new MediaRepository(db, '11999', mediaConfig).backfill(noAbort)).toBe(0);
+  });
+
+  it('recovers a crashed upload with token fencing and reconciles the existing object', async () => {
+    const botId = '11003';
+    const repository = new MediaRepository(db, botId, mediaConfig);
+    await repository.initialize();
+    await new TelegramStore(db, botId).saveBatch([mediaUpdate]);
+    await repository.discover();
+    const original = (await repository.claim())!;
+    await repository.uploading(original);
+    const storage = new MemoryArchive();
+    await storage.put(original, Readable.from([fileBytes])); // Process dies before complete().
+    const replacement = new MediaRepository(db, botId, mediaConfig);
+    await replacement.initialize();
+    const resumed = (await replacement.claim())!;
+    expect(resumed.id).toBe(original.id);
+    expect(resumed.attempt_token).not.toBe(original.attempt_token);
+    await expect(repository.complete(original, { size: 3, sha256: fileHash, etag: 'stale' })).rejects.toThrow('MEDIA_LEASE_LOST');
+    expect(await archiveJob({ job: resumed, repository: replacement, storage,
+      files: { async download() { throw new Error('must not download twice'); } },
+      config: mediaConfig, signal: noAbort, logger: mediaLogger })).toBe(true);
+    expect(storage.puts).toBe(1);
+    expect((await mediaRows(botId))[0]).toMatchObject({ archive_status: 'archived', sha256: fileHash });
+  });
+
+  it('persists retry dates and terminal failures, allowing a safe manual retry without changing raw updates', async () => {
+    const botId = '11004';
+    const repository = new MediaRepository(db, botId, mediaConfig);
+    await repository.initialize();
+    await new TelegramStore(db, botId).saveBatch([mediaUpdate]);
+    await repository.discover();
+    const first = (await repository.claim())!;
+    await repository.failure(first, 'S3_UNAVAILABLE', new Date(Date.now() + 60_000));
+    expect(await repository.claim()).toBeUndefined();
+    expect(await repository.stats()).toEqual({ pending: 1, failed: 0, errors: 1 });
+    await db.updateTable('telegram_media_objects').set({ next_attempt_at: new Date(0) }).where('id', '=', first.id).execute();
+    const second = (await repository.claim())!;
+    expect(second.attempt_count).toBe(2);
+    await repository.failure(second, 'S3_ACCESS_DENIED', null);
+    expect(await repository.stats()).toEqual({ pending: 0, failed: 1, errors: 1 });
+    expect(await repository.claim()).toBeUndefined();
+    expect(await repository.retryFailed()).toBe(1);
+    const third = (await repository.claim())!;
+    expect(third).toMatchObject({ attempt_count: 1, s3_key: first.s3_key });
+    await repository.failure(third, 'INTERRUPTED', new Date(), true);
+    expect((await mediaRows(botId))[0]).toMatchObject({ attempt_count: 0, archive_status: 'pending' });
+    expect(await counts(botId)).toEqual({ updates: 1, messages: 1, events: 1 });
+  });
+
+  it('claims each job once concurrently and leaves unsupported/text-only events intact', async () => {
+    const botId = '11005';
+    const repository = new MediaRepository(db, botId, mediaConfig);
+    await repository.initialize();
+    await new TelegramStore(db, botId).saveBatch([mediaUpdate,
+      { update_id: 102, message: { ...mediaUpdate.message, message_id: 52 } },
+      { update_id: 103, message: { ...textUpdate.message as JsonObject, message_id: 53 } },
+      { update_id: 104, message: { ...textUpdate.message as JsonObject, message_id: 54, sticker: { file_id: 'sticker' } } }]);
+    expect((await repository.discover()).inserted).toBe(2);
+    const claims = await Promise.all([repository.claim(), repository.claim(), repository.claim()]);
+    expect(new Set(claims.filter(Boolean).map(job => job!.id)).size).toBe(2);
+    expect(claims.filter(Boolean)).toHaveLength(2);
+    expect(await counts(botId)).toEqual({ updates: 4, messages: 4, events: 4 });
+  });
+
+  it('runs the worker with bounded concurrency while new raw updates continue committing during stalled S3 uploads', async () => {
+    const botId = '11006';
+    const repository = new MediaRepository(db, botId, mediaConfig);
+    await repository.initialize();
+    const store = new TelegramStore(db, botId);
+    await store.saveBatch(Array.from({ length: 4 }, (_, index) => ({ update_id: 200 + index,
+      message: { ...mediaUpdate.message, message_id: 200 + index } })));
+    const controller = new AbortController();
+    const storage = new MemoryArchive();
+    let active = 0;
+    let peak = 0;
+    let releaseUploads!: () => void;
+    const gate = new Promise<void>(resolve => { releaseUploads = resolve; });
+    const originalPut = storage.put.bind(storage);
+    storage.put = async (job, body) => {
+      active++;
+      peak = Math.max(active, peak);
+      try { await gate; return await originalPut(job, body); }
+      finally { active--; }
+    };
+    const state: MediaHealth = { status: 'degraded', pending: 0, failed: 0, last_scan_at: null, last_error_code: null };
+    const task = runMediaWorker({ repository, files, storage, config: mediaConfig, state,
+      signal: controller.signal, logger: mediaLogger, assertLeadership: async () => {} });
+    try {
+      for (let i = 0; i < 100 && active < 2; i++) await delay(20);
+      expect(active).toBe(2);
+      // This COMMIT completes while network work is blocked on the gate.
+      await store.saveBatch([{ update_id: 204, message: { ...textUpdate.message as JsonObject, message_id: 204 } }]);
+      expect((await counts(botId)).updates).toBe(5);
+      releaseUploads();
+      for (let i = 0; i < 150 && (await mediaRows(botId)).some(row => row.archive_status !== 'archived'); i++) await delay(20);
+      expect((await mediaRows(botId)).every(row => row.archive_status === 'archived')).toBe(true);
+      expect(peak).toBe(2);
+    } finally { releaseUploads(); controller.abort(); await task; }
+  });
 });

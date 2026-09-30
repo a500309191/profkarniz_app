@@ -1,11 +1,13 @@
 import { createServer } from 'node:http';
 import type { CollectorState } from '../telegram/collector.js';
+import type { MediaHealth } from '../media/types.js';
 
 export function createHealthServer(options: {
   state: CollectorState;
   staleSeconds: number;
   checkDatabase: () => Promise<void>;
   now?: () => number;
+  media?: MediaHealth;
 }) {
   const now = options.now ?? Date.now;
   const server = createServer((request, response) => {
@@ -36,6 +38,9 @@ export function createHealthServer(options: {
       });
       response.end(JSON.stringify({ status: healthy ? 'ok' : 'unavailable',
         database: database ? 'up' : 'down',
+        ...(options.media ? { media_archive: { ...options.media,
+          status: options.media.status !== 'disabled' && (!options.media.last_scan_at ||
+            now() - Date.parse(options.media.last_scan_at) > 30_000) ? 'degraded' : options.media.status } } : {}),
         collector: { phase: state.phase, healthy: polling,
           last_success_at: state.lastSuccessAt === null ? null : new Date(state.lastSuccessAt).toISOString(),
           last_error: state.lastError } }));

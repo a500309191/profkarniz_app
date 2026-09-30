@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { readMediaConfig, type MediaConfig } from './media/config.js';
 
 const integer = (fallback: number, min: number, max: number) =>
   z.coerce.number().int().min(min).max(max).default(fallback);
@@ -22,14 +23,14 @@ const appSchema = databaseSchema.extend({
 });
 
 export type DatabaseConfig = z.infer<typeof databaseSchema>;
-export type Config = z.infer<typeof appSchema>;
+export type Config = z.infer<typeof appSchema> & { media: MediaConfig };
 
 export function readDatabaseConfig(env: NodeJS.ProcessEnv = process.env): DatabaseConfig {
   return parseConfig(databaseSchema, env);
 }
 
 export function readConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  return parseConfig(appSchema, env);
+  return { ...parseConfig(appSchema, env), media: readMediaConfig(env) };
 }
 
 function parseConfig<T>(schema: z.ZodType<T>, env: NodeJS.ProcessEnv): T {

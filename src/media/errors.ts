@@ -3,6 +3,26 @@ import { TelegramError } from '../telegram/client.js';
 export class MediaError extends Error {
   constructor(readonly code: string, readonly retryable: boolean, readonly retryAfterMs = 0) { super(code); }
 }
+
+const safeS3Codes = new Set(['AccessDenied', 'Forbidden', 'InvalidAccessKeyId', 'SignatureDoesNotMatch',
+  'AuthorizationHeaderMalformed', 'InvalidToken', 'ExpiredToken', 'RequestTimeTooSkewed',
+  'NoSuchBucket', 'NoSuchKey', 'NotFound', 'PermanentRedirect', 'IllegalLocationConstraintException',
+  'InvalidRequest', 'PreconditionFailed', 'SlowDown', 'InternalError', 'ServiceUnavailable']);
+
+// Never include SDK messages, request URLs, headers, bodies or arbitrary names.
+export function s3ErrorDetails(error: unknown) {
+  let httpStatus: number | null = null;
+  let s3Code: string | null = null;
+  if (typeof error === 'object' && error !== null) {
+    if ('$metadata' in error && typeof error.$metadata === 'object' && error.$metadata !== null &&
+      'httpStatusCode' in error.$metadata) {
+      const status = error.$metadata.httpStatusCode;
+      if (typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599) httpStatus = status;
+    }
+    if ('name' in error && typeof error.name === 'string' && safeS3Codes.has(error.name)) s3Code = error.name;
+  }
+  return { http_status: httpStatus, s3_code: s3Code };
+}
 export function classifyMediaError(error: unknown, stage: 'telegram' | 's3' | 'database'): MediaError {
   if (error instanceof MediaError) return error;
   if (error instanceof TelegramError) {

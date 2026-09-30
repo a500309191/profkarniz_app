@@ -6,7 +6,7 @@ export const mediaConfig: EnabledMediaConfig = {
   enabled: true, MEDIA_CONCURRENCY: 2, MEDIA_MAX_ATTEMPTS: 5,
   MEDIA_JOB_TIMEOUT_SECONDS: 10, MEDIA_MAX_FILE_BYTES: 20 * 1024 * 1024,
   s3: { S3_ENDPOINT: 'https://s3.example.test', S3_REGION: 'test', S3_BUCKET: 'archive-test',
-    S3_ACCESS_KEY_ID: 'test-access', S3_SECRET_ACCESS_KEY: 'test-secret' }
+    S3_FORCE_PATH_STYLE: 'true', S3_ACCESS_KEY_ID: 'test-access', S3_SECRET_ACCESS_KEY: 'test-secret' }
 };
 export function mediaJob(overrides: Partial<MediaJob> = {}): MediaJob {
   return { id: '1', bot_id: '123', telegram_message_event_id: '7', attachment_index: 0,

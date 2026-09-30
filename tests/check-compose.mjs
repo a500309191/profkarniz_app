@@ -7,6 +7,7 @@ import process from 'node:process';
 const env = { ...process.env, POSTGRES_PASSWORD: 'compose-validation-only',
   TELEGRAM_BOT_TOKEN: '123:COMPOSE_VALIDATION_ONLY', HTTP_PORT: '3300', HOST_POSTGRES_PORT: '55433',
   MEDIA_ARCHIVE_ENABLED: 'true', MEDIA_CONCURRENCY: '2', S3_ENDPOINT: 'https://s3.example.test',
+  S3_FORCE_PATH_STYLE: 'false',
   S3_REGION: 'test', S3_BUCKET: 'archive-test', S3_ACCESS_KEY_ID: 'test-access', S3_SECRET_ACCESS_KEY: 'test-secret' };
 function config(files) {
   return JSON.parse(execFileSync('docker', ['compose', ...files.flatMap(file => ['-f', file]),
@@ -34,7 +35,7 @@ try {
   assert.equal(host.services.migrate.network_mode, undefined);
   assert.equal(host.volumes.postgres_data.name, base.volumes.postgres_data.name);
   assert.equal(app.read_only, true);
-  for (const field of ['MEDIA_ARCHIVE_ENABLED', 'MEDIA_CONCURRENCY', 'S3_ENDPOINT', 'S3_REGION', 'S3_BUCKET', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY']) {
+  for (const field of ['MEDIA_ARCHIVE_ENABLED', 'MEDIA_CONCURRENCY', 'S3_ENDPOINT', 'S3_REGION', 'S3_BUCKET', 'S3_FORCE_PATH_STYLE', 'S3_ACCESS_KEY_ID', 'S3_SECRET_ACCESS_KEY']) {
     assert.equal(base.services.application.environment[field], env[field]);
     assert.equal(app.environment[field], env[field]);
     assert.equal(host.services.migrate.environment[field], undefined);

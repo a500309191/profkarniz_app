@@ -155,6 +155,7 @@ docker-compose.test.yml     изолированные тесты без реа�
 | `S3_ENDPOINT` | нет | HTTPS origin без пути, credentials, query/hash; в примере `https://s3.ru-7.storage.selcloud.ru` |
 | `S3_REGION` | нет | Регион, для production `ru-7` |
 | `S3_BUCKET` | нет | Уже созданный **private** bucket, для production `profkarniz-storage` |
+| `S3_FORCE_PATH_STYLE` | `true` | `true`: bucket в пути; `false`: virtual-hosted-style для DNS-совместимого имени bucket |
 | `S3_ACCESS_KEY_ID` | нет | Ключ доступа, только environment |
 | `S3_SECRET_ACCESS_KEY` | нет | Секретный ключ, только environment |
 | `MEDIA_CONCURRENCY` | `2` | Одновременные jobs, 1–4 |
@@ -428,18 +429,99 @@ jitter 0.5–1.5; базовая задержка ограничена часо�
 Создайте bucket `profkarniz-storage` как **private**, без публичной bucket policy.
 Приложению нужны только:
 
-| Право | Область |
-| --- | --- |
-| `s3:ListBucket` | bucket `profkarniz-storage`; проверка `s3:check` |
-| `s3:GetObject` | `telegram/*` и `test/*`; HEAD/GET и reconciliation |
-| `s3:PutObject` | `telegram/*` и `test/*`; архив и техническая проверка |
+| Запрос | Право | Resource в JSON policy |
+| --- | --- | --- |
+| `ListObjectsV2` | `s3:ListBucket` | `arn:aws:s3:::profkarniz-storage` |
+| `PutObject` | `s3:PutObject` | `arn:aws:s3:::profkarniz-storage/telegram/*` и `arn:aws:s3:::profkarniz-storage/test/*` |
+| `HeadObject` | `s3:GetObject` | Те же object resources |
+| `GetObject` | `s3:GetObject` | Те же object resources |
+
+`arn:aws:s3:::profkarniz-storage/*` также покрывает оба префикса. Отдельных действий
+`s3:HeadObject` / `s3:ListObjectsV2` добавлять не нужно. HEAD использует право чтения
+объекта; ListBucket также позволяет отличить отсутствующий объект (404) от запрета
+доступа (403). Наш SDK не вызывает ListBuckets или GetBucketLocation, не передаёт
+ACL, tags, versionId или KMS-параметры.
+[ListObjectsV2](https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html),
+[PutObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html),
+[HeadObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html),
+[GetObject](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html).
+
+В Selectel достаточно роли `s3.bucket.user` в проекте бакета и Bucket policy с
+этими Allow для ID сервисного пользователя. В `Principal.AWS` нужен его ID из
+Selectel, а не отображаемое имя или Access Key. Если Resource в экспортированном
+JSON содержит только имя бакета, исправьте его на указанный ARN; отображение имени
+в UI само по себе не означает ошибку. Учитываются также Deny и Conditions.
+Повышение до `s3.admin` для этих запросов не требуется.
+[Selectel: доступ в S3](https://docs.selectel.ru/s3/about/manage-access/),
+[структура Bucket policy](https://docs.selectel.ru/s3/buckets/bucket-policy/about-bucket-policy/).
 
 Права DeleteObject, ACL, создание bucket и управление lifecycle не нужны.
 Приложение не публикует объекты, не создаёт presigned/public URLs и не предоставляет
 endpoint чтения файлов. Приватность существующей bucket policy контролируется
 в Selectel: команда доступа не меняет и не проверяет её. AWS SDK v3 использует
-path-style, SigV4 и TLS verification; Selectel поддерживает conditional writes.
+выбранный стиль адресации, SigV4 и TLS verification; Selectel поддерживает conditional writes.
 [Selectel S3 compatibility](https://docs.selectel.ru/en/api/object-storage-s3/).
+
+### vHosted и диагностика AccessDenied
+
+Selectel описывает vHosted как `<bucket>.<s3-domain>` и рекомендует этот тип при
+создании бакета. Однако его инструкция для S3 Browser допускает Path-Style и для
+vHosted-бакетов. Поэтому один HTTP 403 не доказывает несовместимость адресации.
+[Типы адресации](https://docs.selectel.ru/s3/buckets/addressing-types/),
+[настройка S3 Browser, шаг 11](https://docs.selectel.ru/s3/tools/s3-browser/).
+
+`S3_FORCE_PATH_STYLE=true` сохраняет прежнее поведение. Для явного vHosted задайте
+`S3_FORCE_PATH_STYLE=false`. При текущих production параметрах SDK сформирует:
+
+```text
+true:  https://s3.ru-7.storage.selcloud.ru/profkarniz-storage/<key>
+false: https://profkarniz-storage.s3.ru-7.storage.selcloud.ru/<key>
+```
+
+`S3_ENDPOINT` в обоих случаях остаётся региональным
+`https://s3.ru-7.storage.selcloud.ru`, bucket указывается отдельно. Не добавляйте
+имя бакета в endpoint вручную. Для данного имени без точек SDK использует
+virtual-hosted-style при `false`; для IP endpoints и несовместимых имён SDK может
+выбрать path-style. TLS verification не отключается. Смена стиля не меняет key,
+bucket или сохранённое назначение jobs.
+
+`s3:check` выполняет запросы строго последовательно:
+`ListObjectsV2(prefix=test/, max-keys=1) → PutObject(test/access-check-UUID.txt) → HeadObject → GetObject`.
+После ошибки следующие операции не выполняются. Лог теперь показывает
+`addressing_style`, начало каждой `operation`, а при ошибке — её имя, `http_status`
+и `s3_code` из ограниченного списка безопасных значений. Пример формата ошибки
+(не результат проверки вашего production):
+
+```json
+{"event":"media_command_failed","code":"S3_ACCESS_DENIED","operation":"ListObjectsV2","http_status":403,"s3_code":"AccessDenied"}
+```
+
+Старый `S3_ACCESS_DENIED` — обобщение любого 401/403; под ним мог скрываться,
+например, `SignatureDoesNotMatch`. HEAD может не вернуть XML-код ошибки: тогда
+`s3_code` будет `null` или `Forbidden`, но имя операции и HTTP status сохранятся.
+Тексты ответов, request headers, подписи и credentials не печатаются.
+
+После обновления кода и сборки сравните два режима с теми же credentials и policy:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml build application
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
+  run --rm --no-deps -e S3_FORCE_PATH_STYLE=true application npm run s3:check
+docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
+  run --rm --no-deps -e S3_FORCE_PATH_STYLE=false application npm run s3:check
+```
+
+Каждая успешная проверка оставляет свой маленький технический объект в `test/`.
+Если path-style получает отказ, а vHosted проходит, закрепите
+`S3_FORCE_PATH_STYLE=false` в `.env` и пересоздайте application с теми же Compose
+файлами. Права при этом расширять не нужно.
+
+Если отказ сохраняется, сопоставьте `operation` с таблицей прав. Для ListObjectsV2
+проверьте разрешение ListBucket на ARN самого бакета и условия, допускающие `test/`
+и `max-keys=1`. Для Put/Head/Get проверьте Allow на `test/*`; worker также требует
+`telegram/*`. Если Allow уже корректны, проверяются совпадение Principal с владельцем
+S3 key, роль в нужном проекте, Deny/Conditions и безопасный `s3_code` ошибки.
+По одному старому коду без этапа нельзя достоверно назначить изменение policy.
 
 ### Обновление production с существующим host-network
 

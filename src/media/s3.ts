@@ -7,7 +7,8 @@ import { MediaError } from './errors.js';
 import { hashStream } from './streams.js';
 
 export function createS3Client(config: S3Config) {
-  return new S3Client({ endpoint: config.S3_ENDPOINT, region: config.S3_REGION, forcePathStyle: true,
+  return new S3Client({ endpoint: config.S3_ENDPOINT, region: config.S3_REGION,
+    forcePathStyle: config.S3_FORCE_PATH_STYLE === 'true',
     credentials: { accessKeyId: config.S3_ACCESS_KEY_ID, secretAccessKey: config.S3_SECRET_ACCESS_KEY },
     // The durable worker owns retries; a consumed request stream is not replayable.
     maxAttempts: 1, requestChecksumCalculation: 'WHEN_REQUIRED', responseChecksumValidation: 'WHEN_REQUIRED',
@@ -44,14 +45,21 @@ export class S3Archive implements ArchiveStorage {
   }
 }
 
-export async function checkS3Access(client: S3Client, bucket: string, signal: AbortSignal) {
+export type S3CheckOperation = 'ListObjectsV2' | 'PutObject' | 'HeadObject' | 'GetObject';
+
+export async function checkS3Access(client: S3Client, bucket: string, signal: AbortSignal,
+  onOperation?: (operation: S3CheckOperation) => void) {
+  onOperation?.('ListObjectsV2');
   await client.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: 'test/', MaxKeys: 1 }), { abortSignal: signal });
   const key = `test/access-check-${randomUUID()}.txt`;
   const body = Buffer.from('ProfKarniz S3 access check\n');
+  onOperation?.('PutObject');
   await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body,
     ContentLength: body.length, ContentType: 'text/plain', IfNoneMatch: '*' }), { abortSignal: signal });
+  onOperation?.('HeadObject');
   const head = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: key }), { abortSignal: signal });
   if (head.ContentLength !== body.length) throw new MediaError('S3_CHECK_SIZE_MISMATCH', false);
+  onOperation?.('GetObject');
   const result = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }), { abortSignal: signal });
   if (!(result.Body instanceof Readable)) throw new MediaError('S3_INVALID_RESPONSE', true);
   const actual = await hashStream(result.Body, 1024, body.length, signal);

@@ -455,7 +455,7 @@ git pull --ff-only
 docker compose -f docker-compose.yml -f docker-compose.host-network.yml build
 # Проверка только S3: не запускает poller, не отправляет пользовательские данные.
 docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
-  run --rm --no-deps application node dist/media/cli.js s3-check
+  run --rm --no-deps application npm run s3:check
 docker compose -f docker-compose.yml -f docker-compose.host-network.yml stop application
 docker compose -f docker-compose.yml -f docker-compose.host-network.yml run --rm migrate
 docker compose -f docker-compose.yml -f docker-compose.host-network.yml up -d application
@@ -482,7 +482,7 @@ IPv6-first Telegram Agent применяется также к getFile/download,
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
-  run --rm --no-deps application node dist/media/cli.js backfill
+  run --rm --no-deps application npm run media:backfill
 ```
 
 Команда требует `MEDIA_ARCHIVE_ENABLED=true`, работает только с bot_id из текущего
@@ -496,7 +496,7 @@ failed записи не сбрасываются. Обработку продо
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
-  run --rm --no-deps application node dist/media/cli.js retry-failed
+  run --rm --no-deps application npm run media:retry-failed
 ```
 
 Команда сбрасывает только failed jobs текущего bot_id в pending и обнуляет число
@@ -504,17 +504,21 @@ docker compose -f docker-compose.yml -f docker-compose.host-network.yml \
 Просто рестарт приложения не сбрасывает failed. При временном отключении feature
 сохранённые jobs остаются в БД, продолжение начинается после включения.
 
-Локальные npm-команды читают уже заданное окружение:
+Эти же npm-команды работают в production Docker image и локально: они запускают
+скомпилированный `dist/media/cli.js` и читают уже заданное окружение. Для локального
+запуска сначала соберите проект:
 
 ```bash
+npm run build
 npm run s3:check
 npm run media:backfill
 npm run media:retry-failed
 ```
 
 Для `.env` и собранного кода: `node --env-file=.env dist/media/cli.js s3-check`
-(либо `backfill` / `retry-failed`). В runtime Docker image используйте `node dist/...`,
-как выше: dev dependency `tsx` в нём отсутствует. Секреты не передаются аргументами.
+(либо `backfill` / `retry-failed`). Production npm scripts не требуют `tsx` или
+исходников TypeScript; `tsx` остаётся dev dependency для development-команд.
+Секреты не передаются аргументами.
 
 Проверка состояния без имён файлов и текста сообщений:
 
@@ -622,6 +626,8 @@ docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -
 ```bash
 npm run check                # typecheck + lint + unit tests + build
 npm run test:compose         # проверка base/host-network Compose без старта сервисов
+docker build --target runtime -t profkarniz-app:ci .
+npm run test:production-cli  # реальные npm entrypoints внутри runtime image
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from tests
 docker compose -f docker-compose.test.yml down
 ```
@@ -652,6 +658,15 @@ retry/backoff, безопасные ошибки и восстановление
 PostgreSQL tests проверяют jobs, backfill, дубли, редакции, leases/fencing, restart,
 ручной retry и ограничение concurrency при продолжающейся записи raw updates.
 CI не обращается к реальному Telegram/Selectel и не требует S3 credentials.
+
+После сборки runtime image CI отдельно запускает внутри него `npm run s3:check`,
+`npm run media:backfill` и `npm run media:retry-failed`. Smoke test проверяет наличие
+скомпилированного CLI, отсутствие `src`/`tsx` и запуск от непривилегированного
+пользователя. Контейнеры запускаются без сети, credentials и монтирования исходников;
+ожидается штатная структурированная ошибка проверки окружения с exit code 1.
+Ошибка shell/импорта вместо этой проверки проваливает тест. Проверку реальных
+credentials выполняет отдельный production `s3:check`. Для другого тега image:
+`npm run test:production-cli -- profkarniz-app:local`.
 
 Для существующей тестовой PostgreSQL задайте `TEST_DATABASE_URL` через окружение
 и выполните `npm run build && npm run test:integration`. Без URL тесты завершаются

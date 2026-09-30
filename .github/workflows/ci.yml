@@ -33,3 +33,4 @@ jobs:
       - run: npm run test:compose
       - run: npm run test:integration
       - run: docker build --target runtime -t profkarniz-app:ci .
+      - run: npm run test:production-cli

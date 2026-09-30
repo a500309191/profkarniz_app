@@ -19,9 +19,10 @@
     "test": "vitest run --project unit",
     "test:integration": "vitest run --project integration",
     "test:compose": "node tests/check-compose.mjs",
-    "media:backfill": "tsx src/media/cli.ts backfill",
-    "media:retry-failed": "tsx src/media/cli.ts retry-failed",
-    "s3:check": "tsx src/media/cli.ts s3-check",
+    "test:production-cli": "node tests/check-production-cli.mjs",
+    "media:backfill": "node dist/media/cli.js backfill",
+    "media:retry-failed": "node dist/media/cli.js retry-failed",
+    "s3:check": "node dist/media/cli.js s3-check",
     "check": "npm run typecheck && npm run lint && npm test && npm run build"
   },
   "dependencies": {
